@@ -8,9 +8,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 
-# =========================
-# Dataset
-# =========================
 class FacialKeypointsDataset(Dataset):
     def __init__(self, df):
         self.df = df.copy()
@@ -41,9 +38,7 @@ class FacialKeypointsDataset(Dataset):
         )
 
 
-# =========================
-# Model
-# =========================
+
 class KeypointCNN(nn.Module):
     def __init__(self, num_outputs=30):
         super().__init__()
@@ -84,9 +79,6 @@ class KeypointCNN(nn.Module):
         return x
 
 
-# =========================
-# Utils
-# =========================
 def denormalize_keypoints(x):
     return x * 48.0 + 48.0
 
@@ -107,9 +99,7 @@ def plot_predictions(images, preds, n=6):
     plt.show()
 
 
-# =========================
-# Training
-# =========================
+
 def train_model(csv_path="training.csv", epochs=15, batch_size=64, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
