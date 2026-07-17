@@ -1,167 +1,412 @@
+"""
+keypoints_model.py
+
+Importable module for the facial keypoints transfer-learning baseline.
+Intended usage from a notebook:
+
+    from keypoints_model import (
+        KeypointsDataset, build_model, train_head, train_finetune,
+        pixel_rmse, show_sample, get_device,
+    )
+
+    device = get_device()
+    ds = KeypointsDataset("data/training.csv", train=True)
+    train_loader, val_loader = make_loaders(ds, batch_size=64, val_frac=0.1)
+
+    model = build_model().to(device)
+    history_head = train_head(model, train_loader, val_loader, device, epochs=8, lr=1e-3)
+    history_ft = train_finetune(model, train_loader, val_loader, device,
+                                 epochs=25, lr_head=1e-3, lr_backbone=1e-4)
+
+    print(pixel_rmse(model, val_loader, device))
+"""
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision.models import resnet18, ResNet18_Weights
+
+IMG_SIZE = 96
+N_KEYPOINTS = 15
+IMAGENET_MEAN = 0.449
+IMAGENET_STD = 0.226
+
+LOW_MISSINGNESS_COLS = [
+    "left_eye_center_x", "left_eye_center_y",
+    "right_eye_center_x", "right_eye_center_y",
+    "nose_tip_x", "nose_tip_y",
+    "mouth_center_bottom_lip_x", "mouth_center_bottom_lip_y",
+]
+
+SYMMETRIC_X_PAIRS = [
+    ("left_eye_center_x", "right_eye_center_x"),
+]
+
+SYMMETRIC_Y_PAIRS = [
+    ("left_eye_center_y", "right_eye_center_y"),
+]
 
 
-class FacialKeypointsDataset(Dataset):
-    def __init__(self, df):
-        self.df = df.copy()
+def fill_missing_keypoints(df, low_missingness_cols=None):
+    """
+    Imputes ONLY the near-complete columns (default: LOW_MISSINGNESS_COLS).
+    Everything else is left as NaN on purpose - those columns are missing on
+    the majority of rows in this dataset, and imputing them would mean the
+    model gets trained against a repeated constant for most samples. The
+    masked loss in run_epoch() is what handles those, not this function.
 
-        self.df["Image"] = self.df["Image"].apply(
-            lambda x: np.fromstring(x, sep=" ", dtype=np.float32).reshape(96, 96)
-        )
+    Symmetry fill for x-coordinates uses the mirror relationship
+    (left_x ~ IMG_SIZE - right_x), not equality - the two sides are
+    reflections of each other, not duplicates.
+    """
+    df_filled = df.copy()
+    cols = low_missingness_cols if low_missingness_cols is not None else LOW_MISSINGNESS_COLS
 
-        self.df = self.df.dropna().reset_index(drop=True)
+    for left_col, right_col in SYMMETRIC_X_PAIRS:
+        if left_col in cols and right_col in cols:
+            df_filled[left_col] = df_filled[left_col].fillna(IMG_SIZE - df_filled[right_col])
+            df_filled[right_col] = df_filled[right_col].fillna(IMG_SIZE - df_filled[left_col])
 
-        self.images = np.stack(self.df["Image"].values) / 255.0
-        self.keypoints = self.df.drop(columns=["Image"]).values.astype(np.float32)
+    for left_col, right_col in SYMMETRIC_Y_PAIRS:
+        if left_col in cols and right_col in cols:
+            df_filled[left_col] = df_filled[left_col].fillna(df_filled[right_col])
+            df_filled[right_col] = df_filled[right_col].fillna(df_filled[left_col])
 
-        # Normalize keypoints from [0, 96] to [-1, 1]
-        self.keypoints = (self.keypoints - 48.0) / 48.0
+    for col in cols:
+        if col in df_filled.columns:
+            df_filled[col] = df_filled[col].fillna(df_filled[col].median())
+
+    return df_filled
+
+
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# --------------------------------------------------------------------------
+# Dataset
+# --------------------------------------------------------------------------
+class KeypointsDataset(Dataset):
+    """
+    Parses the Kaggle training.csv format: last column 'Image' is a
+    space-separated pixel string, preceding columns are x/y pairs per
+    keypoint with NaN where a keypoint wasn't annotated.
+    """
+
+    def __init__(self, csv_path, train=True):
+        df = pd.read_csv(csv_path)
+        self.train = train
+
+        images = df["Image"].apply(lambda s: np.array(s.split(), dtype=np.float32))
+        self.images = np.stack(images.values).reshape(-1, IMG_SIZE, IMG_SIZE)
+        self.images /= 255.0
+
+        if train:
+            coord_cols = [c for c in df.columns if c != "Image"]
+            assert len(coord_cols) == N_KEYPOINTS * 2, (
+                f"expected {N_KEYPOINTS * 2} coordinate columns, got {len(coord_cols)}"
+            )
+            self.coord_cols = coord_cols  # exact order, reused by make_submission()
+            # Impute only the near-complete columns; leave everything else NaN
+            # so the mask below still excludes it from the loss. See
+            # fill_missing_keypoints() docstring for why the two are split.
+            df = fill_missing_keypoints(df)
+            coords = df[coord_cols].values.astype(np.float32)
+            self.mask = ~np.isnan(coords)
+            coords = np.nan_to_num(coords, nan=0.0)
+            self.coords = (coords / (IMG_SIZE / 2.0)) - 1.0
+        else:
+            self.coord_cols = None
+            self.coords = None
+            self.mask = None
+
+        # ImageId if the CSV has one (Kaggle's test.csv does); otherwise
+        # fall back to 1-indexed row position. Needed to join predictions
+        # against submissionFileFormat.csv later.
+        if "ImageId" in df.columns:
+            self.image_ids = df["ImageId"].values
+        else:
+            self.image_ids = np.arange(1, len(df) + 1)
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
-        image = self.images[idx]
-        image = np.expand_dims(image, axis=0)  # (1, 96, 96)
-        keypoints = self.keypoints[idx]
+        img = self.images[idx]
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        img = np.repeat(img[None, :, :], 3, axis=0)  # 1ch -> 3ch, no conv1 surgery
+        img = torch.from_numpy(img.astype(np.float32))
 
-        return (
-            torch.tensor(image, dtype=torch.float32),
-            torch.tensor(keypoints, dtype=torch.float32),
-        )
-
-
-
-class KeypointCNN(nn.Module):
-    def __init__(self, num_outputs=30):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.regressor = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256 * 6 * 6, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(512, 128),
-            nn.ReLU(),
-
-            nn.Linear(128, num_outputs)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.regressor(x)
-        return x
+        if self.train:
+            target = torch.from_numpy(self.coords[idx])
+            mask = torch.from_numpy(self.mask[idx].astype(np.float32))
+            return img, target, mask
+        return img
 
 
-def denormalize_keypoints(x):
-    return x * 48.0 + 48.0
+def make_loaders(dataset, batch_size=64, val_frac=0.1, num_workers=2, seed=None):
+    """Split a training-mode KeypointsDataset into train/val DataLoaders."""
+    n_val = int(len(dataset) * val_frac)
+    n_train = len(dataset) - n_val
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
+    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=generator)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return train_loader, val_loader
 
 
-def plot_predictions(images, preds, n=6):
-    plt.figure(figsize=(12, 6))
+# --------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------
+def build_model():
+    weights = ResNet18_Weights.IMAGENET1K_V1
+    model = resnet18(weights=weights)
+    model.fc = nn.Linear(model.fc.in_features, N_KEYPOINTS * 2)
+    return model
 
-    for i in range(n):
-        plt.subplot(2, 3, i + 1)
-        img = images[i].squeeze()
-        keypoints = preds[i]
 
-        plt.imshow(img, cmap="gray")
-        plt.scatter(keypoints[0::2], keypoints[1::2], s=10)
-        plt.axis("off")
+def masked_mse(preds, targets, mask):
+    diff2 = (preds - targets) ** 2 * mask
+    return diff2.sum() / mask.sum().clamp(min=1.0)
 
-    plt.tight_layout()
+
+def set_backbone_trainable(model, trainable: bool):
+    for name, param in model.named_parameters():
+        if not name.startswith("fc."):
+            param.requires_grad = trainable
+
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+def run_epoch(model, loader, optimizer, device, train=True):
+    model.train() if train else model.eval()
+    total_loss, n_batches = 0.0, 0
+    with torch.set_grad_enabled(train):
+        for imgs, targets, mask in loader:
+            imgs, targets, mask = imgs.to(device), targets.to(device), mask.to(device)
+            preds = model(imgs)
+            loss = masked_mse(preds, targets, mask)
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+    return total_loss / n_batches
+
+
+def train_head(model, train_loader, val_loader, device, epochs=8, lr=1e-3, verbose=True):
+    """Phase 1: freeze backbone, train the regression head only."""
+    set_backbone_trainable(model, trainable=False)
+    optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr)
+
+    history = {"train": [], "val": []}
+    for epoch in range(epochs):
+        train_loss = run_epoch(model, train_loader, optimizer, device, train=True)
+        val_loss = run_epoch(model, val_loader, optimizer, device, train=False)
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        if verbose:
+            print(f"[head] epoch {epoch+1}/{epochs}  train {train_loss:.4f}  val {val_loss:.4f}")
+    return history
+
+
+def train_finetune(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=25,
+    lr_head=1e-3,
+    lr_backbone=1e-4,
+    checkpoint_path=None,
+    verbose=True,
+):
+    """Phase 2: unfreeze everything, discriminative LR, cosine schedule."""
+    set_backbone_trainable(model, trainable=True)
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.fc.parameters(), "lr": lr_head},
+            {
+                "params": [p for n, p in model.named_parameters() if not n.startswith("fc.")],
+                "lr": lr_backbone,
+            },
+        ]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    history = {"train": [], "val": []}
+    best_val = float("inf")
+    for epoch in range(epochs):
+        train_loss = run_epoch(model, train_loader, optimizer, device, train=True)
+        val_loss = run_epoch(model, val_loader, optimizer, device, train=False)
+        scheduler.step()
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
+        if verbose:
+            print(f"[ft] epoch {epoch+1}/{epochs}  train {train_loss:.4f}  val {val_loss:.4f}")
+
+        if checkpoint_path is not None and val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), checkpoint_path)
+
+    history["best_val"] = best_val
+    return history
+
+
+# --------------------------------------------------------------------------
+# Evaluation / inspection
+# --------------------------------------------------------------------------
+def pixel_rmse(model, loader, device):
+    """RMSE in pixel space (comparable to the Kaggle leaderboard scale),
+    converting back from the [-1, 1] normalized targets used in training."""
+    model.eval()
+    sq_errs, n = 0.0, 0
+    with torch.no_grad():
+        for imgs, targets, mask in loader:
+            imgs, targets, mask = imgs.to(device), targets.to(device), mask.to(device)
+            preds = model(imgs)
+
+            preds_px = (preds + 1) * (IMG_SIZE / 2)
+            targets_px = (targets + 1) * (IMG_SIZE / 2)
+
+            diff2 = (preds_px - targets_px) ** 2 * mask
+            sq_errs += diff2.sum().item()
+            n += mask.sum().item()
+    return (sq_errs / n) ** 0.5
+
+
+def show_sample(dataset, idx):
+    """Requires matplotlib; imported lazily so the module doesn't force
+    a plotting backend on non-notebook callers."""
+    import matplotlib.pyplot as plt
+
+    img, target, mask = dataset[idx]
+    raw = img[0].numpy() * IMAGENET_STD + IMAGENET_MEAN
+    xs = (target[0::2].numpy() + 1) * (IMG_SIZE / 2)
+    ys = (target[1::2].numpy() + 1) * (IMG_SIZE / 2)
+    present = mask[0::2].numpy().astype(bool)
+
+    plt.imshow(raw, cmap="gray")
+    plt.scatter(xs[present], ys[present], c="red", s=15)
+    plt.title(f"sample {idx} — {present.sum()} keypoints")
     plt.show()
 
 
+# --------------------------------------------------------------------------
+# Test-set inference and Kaggle submission
+# --------------------------------------------------------------------------
+def predict_all(model, test_dataset, device, batch_size=64):
+    """
+    Runs the model over every image in a test-mode KeypointsDataset
+    (train=False, so __getitem__ returns just the image tensor) and returns
+    predictions in PIXEL space as an (N, 30) numpy array, ordered by the
+    dataset's iteration order (i.e. matches test_dataset.image_ids).
+    """
+    loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for imgs in loader:
+            imgs = imgs.to(device)
+            preds = model(imgs)
+            preds_px = (preds + 1) * (IMG_SIZE / 2.0)
+            all_preds.append(preds_px.cpu().numpy())
+    return np.concatenate(all_preds, axis=0)
 
-def train_model(csv_path="training.csv", epochs=15, batch_size=64, lr=1e-3):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
 
-    df = pd.read_csv(csv_path)
+def make_submission(
+    model,
+    test_csv_path,
+    submission_format_path,
+    coord_cols,
+    out_path,
+    device,
+    batch_size=64,
+    clip_to_image=True,
+):
+    """
+    Produces a Kaggle-format submission CSV.
 
-    train_df, val_df = train_test_split(df, test_size=0.1, random_state=42)
+    coord_cols: pass train_dataset.coord_cols from the KeypointsDataset you
+    trained on, NOT a separately hardcoded list — this guarantees prediction
+    column N corresponds to the same feature name the model was trained
+    against, even if some future training.csv has columns in a different
+    order.
 
-    train_dataset = FacialKeypointsDataset(train_df)
-    val_dataset = FacialKeypointsDataset(val_df)
+    submission_format_path: submissionFileFormat.csv from Kaggle. The
+    competition does NOT require all 30 keypoints for every test image, so
+    this file tells us exactly which (ImageId, FeatureName) rows to emit —
+    predicting all 30 for every image and shipping that as-is would produce
+    a malformed submission.
+    """
+    test_ds = KeypointsDataset(test_csv_path, train=False)
+    preds_px = predict_all(model, test_ds, device, batch_size=batch_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    if clip_to_image:
+        # model can extrapolate slightly outside [0, 96]; the ground truth
+        # never does, so clipping is a safe, free RMSE improvement
+        preds_px = np.clip(preds_px, 0, IMG_SIZE)
 
-    model = KeypointCNN(num_outputs=30).to(device)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    wide = pd.DataFrame(preds_px, columns=coord_cols)
+    wide.insert(0, "ImageId", test_ds.image_ids)
 
-    best_val_loss = float("inf")
+    long = wide.melt(id_vars="ImageId", var_name="FeatureName", value_name="Location")
 
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
+    fmt = pd.read_csv(submission_format_path)
+    fmt = fmt.drop(columns=["Location"])  # placeholder '?' column, replaced below
 
-        for images, keypoints in train_loader:
-            images = images.to(device)
-            keypoints = keypoints.to(device)
+    submission = fmt.merge(long, on=["ImageId", "FeatureName"], how="left")
+    missing = submission["Location"].isna().sum()
+    if missing:
+        print(f"warning: {missing} required rows had no matching prediction — check coord_cols/ImageId alignment")
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, keypoints)
-            loss.backward()
-            optimizer.step()
+    submission = submission[["RowId", "ImageId", "FeatureName", "Location"]]
+    submission.to_csv(out_path, index=False)
+    print(f"wrote {len(submission)} rows to {out_path}")
+    return submission
 
-            train_loss += loss.item() * images.size(0)
 
-        train_loss /= len(train_loader.dataset)
+def plot_test_predictions(model, test_csv_path, coord_cols, device, n=9, indices=None, cols=3):
+    """
+    Visual sanity check on test.csv: runs the model and overlays predicted
+    keypoints on a grid of test images. There's no ground truth for test.csv
+    (that's the whole point of a test set), so this is purely an eyeball
+    check — if points land off-face or clustered in a corner, something's
+    wrong upstream (column order, normalization, a stale checkpoint), not
+    a "the model needs more epochs" situation.
+    """
+    import matplotlib.pyplot as plt
 
-        model.eval()
-        val_loss = 0.0
+    test_ds = KeypointsDataset(test_csv_path, train=False)
+    if indices is None:
+        indices = np.random.choice(len(test_ds), size=min(n, len(test_ds)), replace=False)
+    n = len(indices)
+    rows = int(np.ceil(n / cols))
 
-        with torch.no_grad():
-            for images, keypoints in val_loader:
-                images = images.to(device)
-                keypoints = keypoints.to(device)
+    model.eval()
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+    axes = np.array(axes).reshape(-1)
 
-                outputs = model(images)
-                loss = criterion(outputs, keypoints)
-                val_loss += loss.item() * images.size(0)
+    with torch.no_grad():
+        for ax, idx in zip(axes, indices):
+            img = test_ds[idx].unsqueeze(0).to(device)
+            pred = model(img)[0].cpu().numpy()
+            pred_px = (pred + 1) * (IMG_SIZE / 2.0)
+            xs, ys = pred_px[0::2], pred_px[1::2]
 
-        val_loss /= len(val_loader.dataset)
+            raw = test_ds[idx][0].numpy() * IMAGENET_STD + IMAGENET_MEAN
+            ax.imshow(raw, cmap="gray")
+            ax.scatter(xs, ys, c="red", s=12)
+            ax.set_title(f"img {test_ds.image_ids[idx]}", fontsize=9)
+            ax.axis("off")
 
-        print(
-            f"Epoch {epoch + 1}/{epochs} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f}"
-        )
+    for ax in axes[n:]:
+        ax.axis("off")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_keypoint_model.pth")
-            print("Best model saved.")
-
-    return model, val_loader, device
-
+    plt.tight_layout()
+    plt.show()
