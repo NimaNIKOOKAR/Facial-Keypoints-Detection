@@ -1,32 +1,11 @@
-"""
-keypoints_model.py
-
-Importable module for the facial keypoints transfer-learning baseline.
-Intended usage from a notebook:
-
-    from keypoints_model import (
-        KeypointsDataset, build_model, train_head, train_finetune,
-        pixel_rmse, show_sample, get_device,
-    )
-
-    device = get_device()
-    ds = KeypointsDataset("data/training.csv", train=True)
-    train_loader, val_loader = make_loaders(ds, batch_size=64, val_frac=0.1)
-
-    model = build_model().to(device)
-    history_head = train_head(model, train_loader, val_loader, device, epochs=8, lr=1e-3)
-    history_ft = train_finetune(model, train_loader, val_loader, device,
-                                 epochs=25, lr_head=1e-3, lr_backbone=1e-4)
-
-    print(pixel_rmse(model, val_loader, device))
-"""
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision.models import resnet18, ResNet18_Weights
+from scipy.ndimage import gaussian_filter
+from joblib import Parallel, delayed
 
 IMG_SIZE = 96
 N_KEYPOINTS = 15
@@ -85,6 +64,40 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def sharpen_image(img, amount=1.0, radius=1.0):
+    """
+    Unsharp masking: sharpened = img + amount * (img - blurred(img)).
+    This is NOT deblurring (no attempt to invert an unknown blur kernel) —
+    it boosts local contrast at edges, which is what actually reads as
+    "sharper" at 96x96 resolution and is stable/cheap unlike blind
+    deconvolution. Operates on a single (96, 96) float array in [0, 1].
+    """
+    blurred = gaussian_filter(img, sigma=radius)
+    sharpened = img + amount * (img - blurred)
+    return np.clip(sharpened, 0.0, 1.0)
+
+
+def preprocess_images_parallel(images, sharpen_amount=1.0, sharpen_radius=1.0, n_jobs=-1, verbose=True):
+    """
+    Applies sharpen_image across an (N, 96, 96) array using joblib, run ONCE
+    up front rather than per-epoch. n_jobs=-1 uses all available cores.
+    verbose=True prints joblib's own progress output so you can confirm
+    it's actually dispatching to multiple workers, not silently running
+    single-threaded.
+    """
+    import os
+
+    resolved_jobs = os.cpu_count() if n_jobs == -1 else n_jobs
+    if verbose:
+        print(f"preprocess_images_parallel: dispatching {len(images)} images across n_jobs={n_jobs} "
+              f"(resolves to {resolved_jobs} workers on this machine)")
+
+    sharpened = Parallel(n_jobs=n_jobs, backend="threading", verbose=10 if verbose else 0)(
+        delayed(sharpen_image)(img, sharpen_amount, sharpen_radius) for img in images
+    )
+    return np.stack(sharpened)
+
+
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
@@ -95,13 +108,20 @@ class KeypointsDataset(Dataset):
     keypoint with NaN where a keypoint wasn't annotated.
     """
 
-    def __init__(self, csv_path, train=True):
+    def __init__(self, csv_path, train=True, sharpen=False, sharpen_amount=1.0, sharpen_radius=1.0, n_jobs=-1):
         df = pd.read_csv(csv_path)
         self.train = train
 
         images = df["Image"].apply(lambda s: np.array(s.split(), dtype=np.float32))
         self.images = np.stack(images.values).reshape(-1, IMG_SIZE, IMG_SIZE)
         self.images /= 255.0
+
+        if sharpen:
+            # Done once here, not in __getitem__ — otherwise every epoch
+            # re-runs the same sharpening on the same pixels for no benefit.
+            self.images = preprocess_images_parallel(
+                self.images, sharpen_amount=sharpen_amount, sharpen_radius=sharpen_radius, n_jobs=n_jobs
+            )
 
         if train:
             coord_cols = [c for c in df.columns if c != "Image"]
@@ -182,32 +202,54 @@ def set_backbone_trainable(model, trainable: bool):
 # --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
-def run_epoch(model, loader, optimizer, device, train=True):
+def run_epoch(model, loader, optimizer, device, train=True, scaler=None):
+    """
+    scaler: pass a torch.amp.GradScaler('cuda') to enable mixed precision.
+    Only does anything useful on CUDA - AMP has no benefit on CPU/MPS, and
+    passing a scaler there is harmless but pointless.
+    """
     model.train() if train else model.eval()
     total_loss, n_batches = 0.0, 0
+    use_amp = scaler is not None and device.type == "cuda"
+
     with torch.set_grad_enabled(train):
         for imgs, targets, mask in loader:
             imgs, targets, mask = imgs.to(device), targets.to(device), mask.to(device)
-            preds = model(imgs)
-            loss = masked_mse(preds, targets, mask)
+
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    preds = model(imgs)
+                    loss = masked_mse(preds, targets, mask)
+            else:
+                preds = model(imgs)
+                loss = masked_mse(preds, targets, mask)
+
             if train:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+
             total_loss += loss.item()
             n_batches += 1
     return total_loss / n_batches
 
 
-def train_head(model, train_loader, val_loader, device, epochs=8, lr=1e-3, verbose=True):
-    """Phase 1: freeze backbone, train the regression head only."""
+def train_head(model, train_loader, val_loader, device, epochs=8, lr=1e-3, verbose=True, amp=True):
+    """Phase 1: freeze backbone, train the regression head only.
+    amp=True enables mixed precision on CUDA (no-op elsewhere)."""
     set_backbone_trainable(model, trainable=False)
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr)
+    scaler = torch.amp.GradScaler('cuda') if (amp and device.type == "cuda") else None
 
     history = {"train": [], "val": []}
     for epoch in range(epochs):
-        train_loss = run_epoch(model, train_loader, optimizer, device, train=True)
-        val_loss = run_epoch(model, val_loader, optimizer, device, train=False)
+        train_loss = run_epoch(model, train_loader, optimizer, device, train=True, scaler=scaler)
+        val_loss = run_epoch(model, val_loader, optimizer, device, train=False, scaler=scaler)
         history["train"].append(train_loss)
         history["val"].append(val_loss)
         if verbose:
@@ -225,8 +267,10 @@ def train_finetune(
     lr_backbone=1e-4,
     checkpoint_path=None,
     verbose=True,
+    amp=True,
 ):
-    """Phase 2: unfreeze everything, discriminative LR, cosine schedule."""
+    """Phase 2: unfreeze everything, discriminative LR, cosine schedule.
+    amp=True enables mixed precision on CUDA (no-op elsewhere)."""
     set_backbone_trainable(model, trainable=True)
     optimizer = torch.optim.Adam(
         [
@@ -238,12 +282,13 @@ def train_finetune(
         ]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = torch.amp.GradScaler('cuda') if (amp and device.type == "cuda") else None
 
     history = {"train": [], "val": []}
     best_val = float("inf")
     for epoch in range(epochs):
-        train_loss = run_epoch(model, train_loader, optimizer, device, train=True)
-        val_loss = run_epoch(model, val_loader, optimizer, device, train=False)
+        train_loss = run_epoch(model, train_loader, optimizer, device, train=True, scaler=scaler)
+        val_loss = run_epoch(model, val_loader, optimizer, device, train=False, scaler=scaler)
         scheduler.step()
         history["train"].append(train_loss)
         history["val"].append(val_loss)
