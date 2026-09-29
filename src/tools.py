@@ -11,19 +11,33 @@ FEATURE_COLORS = {
 
 
 def get_face_with_keypoints(df, image_index):
-    image = np.fromstring(df["Image"][image_index], sep=" ").reshape(96, 96)
 
-    keypoints = df.iloc[image_index, :-1].values.astype("float")
-    keypoints = keypoints.reshape(-1, 2)
+    row = df.loc[image_index]
+
+    image = np.fromstring(
+        row["Image"],
+        sep=" "
+    ).reshape(96, 96)
+
+    keypoint_cols = [
+        col for col in df.columns
+        if col != "Image"
+    ]
+
+    keypoints = (
+        row[keypoint_cols]
+        .values
+        .astype(float)
+        .reshape(-1, 2)
+    )
 
     return image, keypoints
-
 
 def show_face_with_keypoints(df, image_index):
     image, keypoints = get_face_with_keypoints(df, image_index)
 
    
-    columns = df.columns[:-1]
+    columns = [col for col in df.columns if col != "Image"]
 
     plt.figure(figsize=(8, 8))
     plt.imshow(image, cmap="gray")
