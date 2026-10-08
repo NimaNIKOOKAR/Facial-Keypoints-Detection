@@ -10,6 +10,7 @@ FEATURE_COLORS = {
 }
 
 
+
 def get_face_with_keypoints(df, image_index):
 
     row = df.loc[image_index]
@@ -34,12 +35,18 @@ def get_face_with_keypoints(df, image_index):
     return image, keypoints
 
 def show_face_with_keypoints(df, image_index):
+    """ give the image and the keypoints of the image at the given index in the dataframe
+
+    Args:
+        df (_type_): _dataframe containing the images and keypoints
+        image_index (_type_): index of the image in the dataframe requested to be shown
+    """
+
     image, keypoints = get_face_with_keypoints(df, image_index)
 
-   
     columns = [col for col in df.columns if col != "Image"]
 
-    plt.figure(figsize=(8, 8))
+    plt.figure(figsize=(5, 5))
     plt.imshow(image, cmap="gray")
 
     for i in range(0, len(columns), 2):
@@ -83,49 +90,18 @@ def show_face_with_keypoints(df, image_index):
     plt.show()
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-
-
-def compare_keypoints(
-    df_original,
-    df_filled,
-    image_indices,
-    figsize_per_row=(12, 5),
-    show_labels=False
-):
+def compare_keypoints(df_original,df_filled,image_indices,figsize_per_row=(7, 3.5),show_labels=False):
     """
-    Compare original and imputed facial keypoints.
+    Compare original and imputed facial keypoints side by side of the images at the given indices.
 
-    Parameters
-    ----------
-    df_original : pd.DataFrame
-        Original dataset containing missing keypoints.
-
-    df_filled : pd.DataFrame
-        Dataset after imputation.
-
-    image_indices : list
-        List of DataFrame indices to visualize.
-
-    figsize_per_row : tuple
-        Figure width and height per comparison row.
-
-    show_labels : bool
-        Whether to display landmark names.
+    Circles (o): Original keypoints.
+    Crosses (x): Newly imputed keypoints.
     """
 
     if len(image_indices) == 0:
         raise ValueError("Provide at least one image index.")
 
-    feature_colors = {
-        "eye": "red",
-        "eyebrow": "blue",
-        "nose": "green",
-        "mouth": "yellow"
-    }
-
+    # Create compact comparison grid
     fig, axes = plt.subplots(
         nrows=len(image_indices),
         ncols=2,
@@ -133,26 +109,33 @@ def compare_keypoints(
             figsize_per_row[0],
             figsize_per_row[1] * len(image_indices)
         ),
-        squeeze=False
+        squeeze=False,
+        gridspec_kw={
+            "hspace": 0.12,
+            "wspace": 0.05
+        }
     )
+
+    # Get landmark names
+    landmark_names = [
+        col[:-2]
+        for col in df_original.columns
+        if col.endswith("_x")
+        and f"{col[:-2]}_y" in df_original.columns
+    ]
 
     def plot_face(ax, df, idx, is_imputed=False):
 
         row = df.loc[idx]
+        original_row = df_original.loc[idx]
 
+        # Extract image
         image = np.fromstring(
             row["Image"],
             sep=" "
         ).reshape(96, 96)
 
         ax.imshow(image, cmap="gray")
-
-        landmark_names = [
-            col[:-2]
-            for col in df.columns
-            if col.endswith("_x")
-            and f"{col[:-2]}_y" in df.columns
-        ]
 
         for name in landmark_names:
 
@@ -162,23 +145,21 @@ def compare_keypoints(
             if pd.isna(x) or pd.isna(y):
                 continue
 
+            
             if "eyebrow" in name:
-                color = feature_colors["eyebrow"]
+                color = FEATURE_COLORS["eyebrow"]
 
             elif "eye" in name:
-                color = feature_colors["eye"]
+                color = FEATURE_COLORS["eye"]
 
             elif "nose" in name:
-                color = feature_colors["nose"]
+                color = FEATURE_COLORS["nose"]
 
             elif "mouth" in name:
-                color = feature_colors["mouth"]
+                color = FEATURE_COLORS["mouth"]
 
             else:
                 color = "white"
-
-            # Distinguish original and newly imputed points.
-            original_row = df_original.loc[idx]
 
             was_missing = (
                 pd.isna(original_row[f"{name}_x"])
@@ -187,7 +168,6 @@ def compare_keypoints(
 
             if is_imputed and was_missing:
 
-                # Newly reconstructed landmark.
                 ax.scatter(
                     x, y,
                     c=color,
@@ -199,7 +179,6 @@ def compare_keypoints(
 
             else:
 
-                # Originally observed landmark.
                 ax.scatter(
                     x, y,
                     c=color,
@@ -220,11 +199,8 @@ def compare_keypoints(
 
         ax.set_xlim(0, 96)
         ax.set_ylim(96, 0)
+        ax.set_aspect("equal")
         ax.axis("off")
-
-    # -------------------------------------
-    # Create comparison grid
-    # -------------------------------------
 
     for i, idx in enumerate(image_indices):
 
@@ -244,19 +220,24 @@ def compare_keypoints(
 
         axes[i, 0].set_title(
             f"Image {idx} - BEFORE",
-            fontsize=12
+            fontsize=11,
+            pad=5
         )
 
         axes[i, 1].set_title(
             f"Image {idx} - AFTER",
-            fontsize=12
+            fontsize=11,
+            pad=5
         )
 
-    plt.tight_layout()
+    plt.subplots_adjust(
+        left=0.02,
+        right=0.98,
+        top=0.96,
+        bottom=0.02
+    )
+
     plt.show()
-
-
-
 
 
 def fill_missing_keypoints_geometric(df, reference_df=None):
@@ -300,13 +281,14 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
     )
 
     # ------------------------------------------
-    # Helper 1: Learn relative coordinate offsets
+    # Learn relative coordinate offsets
     # ------------------------------------------
 
     def learned_offset(target, anchor):
         """
         Learn the median signed distance between
         two landmarks from original observations.
+
         """
 
         if target not in reference.columns:
@@ -323,10 +305,22 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         return (valid[target] - valid[anchor]).median()
 
     # ------------------------------------------
-    # Helper 2: Eye center from eye corners
+    # Eye center from eye corners
     # ------------------------------------------
 
     def estimate_eye_center(row, side):
+        """ It finds the midpoint of the inner corner and outer corner (inner corner + outer corner) / 2
+        and finds the differnce with the annotated eye center and the position of the missing point (center - midpoint) and 
+        adds it to the midpoint to get the estimated position of the missing point. The final position
+        is (midpoint + offset)
+
+        Args:
+            row (_type_): row of the dataframe containing the keypoints
+            side (_type_): "left" or "right" to indicate which eye to estimate
+
+        Returns:
+            _type_: _description_
+        """
 
         for axis in ("x", "y"):
 
@@ -369,7 +363,7 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         return row
 
     # ------------------------------------------
-    # Helper 3: Estimate facial symmetry axis
+    # Estimate facial symmetry axis
     # ------------------------------------------
 
     def get_face_axis(row):
@@ -389,7 +383,7 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         if pd.notna(nose):
             return nose
 
-        # Alternative: center of the mouth.
+        # center of the mouth.
 
         mouth = row.get(
             "mouth_center_top_lip_x",
@@ -399,11 +393,11 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         if pd.notna(mouth):
             return mouth
 
-        # Final fallback for a 96x96 image.
+        
         return 47.5
 
     # ------------------------------------------
-    # Helper 4: Symmetric keypoint imputation
+    # Symmetric keypoint imputation
     # ------------------------------------------
 
     symmetric_pairs = [
@@ -476,7 +470,7 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         return row
 
     # ------------------------------------------
-    # Helper 5: Lip position from relative distance
+    # Lip position from relative distance
     # ------------------------------------------
 
     def estimate_bottom_lip(row):
@@ -531,7 +525,7 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
         filled.loc[idx, keypoint_cols] = row[keypoint_cols]
 
     # ------------------------------------------
-    # Last resort: Original column medians
+    #  Original column medians
     # ------------------------------------------
 
     medians = reference[keypoint_cols].median()
@@ -548,7 +542,7 @@ def fill_missing_keypoints_geometric(df, reference_df=None):
 # ------------------------------------------
 
 
-def get_landmark_names(df):
+def get_landmark_names(df) -> list[str]:
     """
     Return landmark names in a consistent order.
     """
@@ -563,7 +557,7 @@ def get_landmark_names(df):
     return names
 
 
-def align_landmarks(source, target, mask):
+def align_landmarks(source, target, mask) -> tuple[np.ndarray, float]:
     """
     Align source landmarks to target landmarks using
     a 2D similarity transformation.
@@ -589,7 +583,7 @@ def align_landmarks(source, target, mask):
     P0 = P - p_mean
     Q0 = Q - q_mean
 
-    # Reject degenerate configurations.
+    
     denom = np.sum(P0 ** 2)
 
     if denom < 1e-8:
@@ -630,7 +624,7 @@ def fill_keypoints_pose_knn(
     k=7,
     min_shared=4,
     max_rmse=8.0
-):
+) -> pd.DataFrame:
     """
     Pose-aware facial keypoint imputation using
     aligned nearest neighbors.
@@ -703,7 +697,7 @@ def fill_keypoints_pose_knn(
 
         for j, reference in enumerate(reference_points):
 
-            # Never use the exact same row as its own
+            
             # reference when imputing the same dataset.
             if same_dataset and i == j:
                 continue
@@ -714,10 +708,6 @@ def fill_keypoints_pose_knn(
 
             if common_mask.sum() < min_shared:
                 continue
-
-            # Alignment requires finite coordinates.
-            # Temporarily replace missing reference
-            # coordinates; they are never used for fitting.
 
             safe_reference = np.nan_to_num(
                 reference,
@@ -804,23 +794,26 @@ def fill_keypoints_pose_knn(
     return output
 
 
-def detect_outliers(df):
-    coord_cols = df.columns.drop("Image")
+def detect_outliers(df, image_size=96):
+    """Mask out-of-image landmarks; preserve rows and valid labels."""
+    cleaned = df.copy()
 
-    outlier_mask = pd.Series(False, index=df.index)
+    for x_col in df.columns:
+        if not x_col.endswith("_x"):
+            continue
 
-    for col in coord_cols:
-        Q1 = df[col].quantile(0.25)
-        Q3 = df[col].quantile(0.75)
+        y_col = x_col[:-2] + "_y"
+        if y_col not in df.columns:
+            continue
 
-        IQR = Q3 - Q1
+        x = df[x_col]
+        y = df[y_col]
 
-        lower = Q1 - 1.5 * IQR
-        upper = Q3 + 1.5 * IQR
-
-        outlier_mask |= (
-            (df[col] < lower) |
-            (df[col] > upper)
+        invalid = (
+            (x.notna() & ~x.between(0, image_size - 1))
+            | (y.notna() & ~y.between(0, image_size - 1))
         )
 
-    return outlier_mask
+        cleaned.loc[invalid, [x_col, y_col]] = np.nan
+
+    return cleaned

@@ -9,4 +9,14 @@ from .tools import (
     align_landmarks,
     fill_keypoints_pose_knn,
     compare_keypoints,
+
+)
+
+from .facial_model import ( 
+                           
+    FacialKeypointsDataset,
+    evaluate_model,
+    visualize_predictions,
+    CNN,
+    train_model,
 )
