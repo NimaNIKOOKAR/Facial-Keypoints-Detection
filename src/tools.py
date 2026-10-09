@@ -623,197 +623,103 @@ def fill_keypoints_pose_knn(
     reference_df=None,
     k=7,
     min_shared=4,
-    max_rmse=8.0
+    max_rmse=8.0,
 ) -> pd.DataFrame:
-    """
-    Pose-aware facial keypoint imputation using
-    aligned nearest neighbors.
-
-    df:
-        Dataset to impute.
-
-    reference_df:
-        Original training data with observed labels.
-        Defaults to df.
-
-    k:
-        Number of nearest aligned reference faces.
-
-    min_shared:
-        Minimum number of shared landmark pairs.
-
-    max_rmse:
-        Maximum acceptable alignment error in pixels.
-
-    Important:
-        Reference landmarks must be original
-        observations, not previously imputed labels.
-    """
-
     if reference_df is None:
         reference_df = df
 
-    output = df.copy()
-
+    same_dataset = reference_df is df
     names = get_landmark_names(df)
-
     columns = [
-        coordinate
+        f"{name}_{axis}"
         for name in names
-        for coordinate in (f"{name}_x", f"{name}_y")
+        for axis in ("x", "y")
     ]
 
-    # Convert keypoints to (N, landmarks, 2).
+    def to_points(frame):
+        return frame[columns].to_numpy(dtype=float).reshape(
+            len(frame), len(names), 2
+        )
 
-    query_points = (
-        df[columns]
-        .to_numpy(dtype=float)
-        .reshape(-1, len(names), 2)
-    )
+    queries = to_points(df)
+    references = to_points(reference_df)
 
-    reference_points = (
-        reference_df[columns]
-        .to_numpy(dtype=float)
-        .reshape(-1, len(names), 2)
-    )
+    reference_valid = np.isfinite(references).all(axis=2)
+    safe_references = np.nan_to_num(references, nan=0.0)
+    filled = queries.copy()
 
-    # Use only original observed keypoint pairs.
-    reference_masks = np.isfinite(reference_points).all(axis=2)
+    for i, face in enumerate(queries):
+        observed = np.isfinite(face).all(axis=1)
+        missing_points = np.flatnonzero(~observed)
 
-    reconstructed = query_points.copy()
-
-    same_dataset = reference_df is df
-
-    for i, face in enumerate(query_points):
-
-        query_mask = np.isfinite(face).all(axis=1)
-
-        missing_mask = ~query_mask
-
-        if not missing_mask.any():
+        if not len(missing_points):
             continue
+
+        # Find references with enough shared observed landmarks.
+        shared = reference_valid & observed
+        eligible = shared.sum(axis=1) >= min_shared
+
+        if same_dataset:
+            eligible[i] = False
 
         candidates = []
 
-        for j, reference in enumerate(reference_points):
-
-            
-            # reference when imputing the same dataset.
-            if same_dataset and i == j:
-                continue
-
-            common_mask = (
-                query_mask & reference_masks[j]
-            )
-
-            if common_mask.sum() < min_shared:
-                continue
-
-            safe_reference = np.nan_to_num(
-                reference,
-                nan=0.0
-            )
-
+        for j in np.flatnonzero(eligible):
             aligned, error = align_landmarks(
-                safe_reference,
-                face,
-                common_mask
+                safe_references[j], face, shared[j]
             )
 
-            if aligned is None:
-                continue
+            if (
+                aligned is not None
+                and np.isfinite(error)
+                and error <= max_rmse
+            ):
+                candidates.append((error, j, aligned))
 
-            if not np.isfinite(error):
-                continue
+        candidates.sort(key=lambda candidate: candidate[0])
 
-            if error > max_rmse:
-                continue
-
-            candidates.append(
-                (error, aligned, reference_masks[j])
-            )
-
-        if not candidates:
-            continue
-
-        # Select best aligned neighbors.
-        candidates.sort(key=lambda x: x[0])
-
-        # Select neighbors separately for each
-        # missing landmark. This avoids including
-        # references whose target label is missing.
-
-        for point_idx in np.where(missing_mask)[0]:
-
-            available = [
+        for point in missing_points:
+            neighbors = [
                 candidate
                 for candidate in candidates
-                if candidate[2][point_idx]
+                if reference_valid[candidate[1], point]
             ][:k]
 
-            if not available:
+            if not neighbors:
                 continue
 
-            errors = np.array([
-                item[0] for item in available
+            errors = np.array([error for error, _, _ in neighbors])
+            positions = np.array([
+                aligned[point] for _, _, aligned in neighbors
             ])
-
-            predictions = np.array([
-                item[1][point_idx]
-                for item in available
-            ])
-
-            # Higher weight for more similar faces.
-            weights = 1.0 / (errors + 0.5) ** 2
-            weights /= weights.sum()
 
             estimate = np.average(
-                predictions,
+                positions,
                 axis=0,
-                weights=weights
+                weights=1.0 / (errors + 0.5) ** 2,
             )
 
-            # Preserve every originally observed
-            # coordinate, including partially
-            # observed x/y pairs.
+            missing_axes = ~np.isfinite(face[point])
+            filled[i, point, missing_axes] = estimate[missing_axes]
 
-            missing_coordinates = ~np.isfinite(
-                reconstructed[i, point_idx]
-            )
-
-            reconstructed[
-                i, point_idx, missing_coordinates
-            ] = estimate[missing_coordinates]
-
-    # Restore original DataFrame structure.
-    output[columns] = reconstructed.reshape(
-        len(output),
-        -1
-    )
-
+    output = df.copy()
+    output[columns] = filled.reshape(len(df), len(columns))
     return output
 
 
 def detect_outliers(df, image_size=96):
-    """Mask out-of-image landmarks; preserve rows and valid labels."""
+    """Replace IQR outliers in numeric columns with NaN; preserve rows."""
     cleaned = df.copy()
 
-    for x_col in df.columns:
-        if not x_col.endswith("_x"):
-            continue
+    for col in cleaned.select_dtypes(include="number").columns:
+        Q1 = cleaned[col].quantile(0.25)
+        Q3 = cleaned[col].quantile(0.75)
+        IQR = Q3 - Q1
 
-        y_col = x_col[:-2] + "_y"
-        if y_col not in df.columns:
-            continue
+        lower = Q1 - 2.5 * IQR
+        upper = Q3 + 2.5 * IQR
 
-        x = df[x_col]
-        y = df[y_col]
-
-        invalid = (
-            (x.notna() & ~x.between(0, image_size - 1))
-            | (y.notna() & ~y.between(0, image_size - 1))
-        )
-
-        cleaned.loc[invalid, [x_col, y_col]] = np.nan
+        outliers = cleaned[col].lt(lower) | cleaned[col].gt(upper)
+        cleaned.loc[outliers, col] = np.nan
 
     return cleaned
