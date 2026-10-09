@@ -707,19 +707,3 @@ def fill_keypoints_pose_knn(
     return output
 
 
-def detect_outliers(df, image_size=96):
-    """Replace IQR outliers in numeric columns with NaN; preserve rows."""
-    cleaned = df.copy()
-
-    for col in cleaned.select_dtypes(include="number").columns:
-        Q1 = cleaned[col].quantile(0.25)
-        Q3 = cleaned[col].quantile(0.75)
-        IQR = Q3 - Q1
-
-        lower = Q1 - 2.5 * IQR
-        upper = Q3 + 2.5 * IQR
-
-        outliers = cleaned[col].lt(lower) | cleaned[col].gt(upper)
-        cleaned.loc[outliers, col] = np.nan
-
-    return cleaned
