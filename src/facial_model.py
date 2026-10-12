@@ -14,7 +14,9 @@ import torch.optim as optim
 import numpy as np
 from matplotlib import pyplot as plt
 
+
 class FacialKeypointsDataset(Dataset):
+    
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
 
@@ -275,7 +277,7 @@ def train_model(
 
     for epoch in range(num_epochs):
 
-        # Training
+        
         model.train()
 
         train_error_sum = 0.0
