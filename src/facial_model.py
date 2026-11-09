@@ -20,7 +20,7 @@ class FacialKeypointsDataset(Dataset):
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
 
-        # Select only facial keypoint coordinates
+        
         self.coord_cols = [
             col for col in self.df.columns
             if col.endswith(("_x", "_y"))
@@ -37,7 +37,7 @@ class FacialKeypointsDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        # Image preprocessing
+        
         image = np.fromstring(
             row["Image"],
             sep=" ",
@@ -46,12 +46,12 @@ class FacialKeypointsDataset(Dataset):
 
         image = torch.from_numpy(image).unsqueeze(0)
 
-        # Keypoint preprocessing
+        
         keypoints = row[self.coord_cols].to_numpy(
             dtype=np.float32
         )
 
-        # Normalize coordinates to [0, 1]
+       
         keypoints = keypoints / 95.0
 
         keypoints = torch.from_numpy(keypoints.copy())
@@ -131,11 +131,11 @@ def evaluate_model(model, data_loader, device):
     predictions = torch.cat(predictions, dim=0)
     targets = torch.cat(targets, dim=0)
 
-    # Convert to pixel coordinates
+    
     predictions_px = predictions * 95.0
     targets_px = targets * 95.0
 
-    # Ignore missing coordinates
+    
     valid = torch.isfinite(targets_px)
 
     if not valid.any():
@@ -180,7 +180,7 @@ def visualize_predictions(
 
         ax = axes[0, i]
 
-        # Display image
+        
         image = images[i].squeeze().cpu().numpy()
 
         ax.imshow(
@@ -190,15 +190,15 @@ def visualize_predictions(
             vmax=1
         )
 
-        # Convert normalized coordinates to pixels
+        
         pred = outputs[i].numpy().reshape(-1, 2) * 95.0
         actual = targets[i].numpy().reshape(-1, 2) * 95.0
 
-        # Valid keypoints
+        
         actual_valid = np.isfinite(actual).all(axis=1)
         pred_valid = np.isfinite(pred).all(axis=1)
 
-        # Predicted points
+        
         ax.scatter(
             pred[pred_valid, 0],
             pred[pred_valid, 1],
@@ -209,7 +209,7 @@ def visualize_predictions(
             zorder=2
         )
 
-        # Actual points
+        
         ax.scatter(
             actual[actual_valid, 0],
             actual[actual_valid, 1],
@@ -221,7 +221,7 @@ def visualize_predictions(
             zorder=3
         )
 
-        # MAE on fully observed landmarks
+        
         comparable = actual_valid & pred_valid
 
         if comparable.any():
@@ -290,7 +290,7 @@ def train_model(
 
             predictions = model(images)
 
-            # Ignore missing target values
+            
             valid = torch.isfinite(targets)
 
             if not valid.any():
@@ -311,7 +311,7 @@ def train_model(
             train_error_sum += loss.item() * count
             train_valid_count += count
 
-        # Validation
+        
         model.eval()
 
         val_error_sum = 0.0

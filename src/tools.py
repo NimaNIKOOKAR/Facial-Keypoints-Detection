@@ -101,7 +101,7 @@ def compare_keypoints(df_original,df_filled,image_indices,figsize_per_row=(7, 3.
     if len(image_indices) == 0:
         raise ValueError("Provide at least one image index.")
 
-    # Create compact comparison grid
+    
     fig, axes = plt.subplots(
         nrows=len(image_indices),
         ncols=2,
@@ -116,7 +116,7 @@ def compare_keypoints(df_original,df_filled,image_indices,figsize_per_row=(7, 3.
         }
     )
 
-    # Get landmark names
+    
     landmark_names = [
         col[:-2]
         for col in df_original.columns
@@ -129,7 +129,7 @@ def compare_keypoints(df_original,df_filled,image_indices,figsize_per_row=(7, 3.
         row = df.loc[idx]
         original_row = df_original.loc[idx]
 
-        # Extract image
+        
         image = np.fromstring(
             row["Image"],
             sep=" "
@@ -243,7 +243,7 @@ def compare_keypoints(df_original,df_filled,image_indices,figsize_per_row=(7, 3.
 
 # ------------------------------------------
 # fill with KNN-based geometric alignment
-# ------------------------------------------
+
 
 
 def get_landmark_names(df) -> list[str]:
@@ -293,7 +293,7 @@ def align_landmarks(source, target, mask) -> tuple[np.ndarray, float]:
     if denom < 1e-8:
         return None, np.inf
 
-    # Optimal 2D rotation and scale.
+    
     a = np.sum(
         P0[:, 0] * Q0[:, 0]
         + P0[:, 1] * Q0[:, 1]
@@ -359,7 +359,7 @@ def fill_keypoints_pose_knn(
         if not len(missing_points):
             continue
 
-        # Find references with enough shared observed landmarks.
+        
         shared = reference_valid & observed
         eligible = shared.sum(axis=1) >= min_shared
 
